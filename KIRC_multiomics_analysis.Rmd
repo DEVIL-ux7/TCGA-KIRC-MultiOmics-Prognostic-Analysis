@@ -1,0 +1,951 @@
+---
+title: "TCGA-KIRC Multi-Omics Prognostic Biomarker Analysis"
+author: "Jialu Li"
+output: html_document
+---
+
+```{r}
+local({
+  r <- getOption("repos")
+  r["CRAN"] <- "https://cloud.r-project.org"
+  options(repos = r)
+})
+if (!requireNamespace("data.table", quietly = TRUE)) install.packages("data.table")
+if (!requireNamespace("R.utils", quietly = TRUE)) install.packages("R.utils")
+
+library(data.table)
+library(survival)
+```
+
+
+```{r}
+# Hi-Seq Data
+download.file("https://tcga-xena-hub.s3.us-east-1.amazonaws.com/download/TCGA.KIRC.sampleMap%2FHiSeqV2.gz", "HiSeqV2.gz")
+
+# Methylation
+download.file("https://tcga-xena-hub.s3.us-east-1.amazonaws.com/download/TCGA.KIRC.sampleMap%2FHumanMethylation450.gz", "HumanMethylation450.gz")
+
+# Curated Survival Data
+download.file(
+  "https://tcga-xena-hub.s3.us-east-1.amazonaws.com/download/survival%2FKIRC_survival.txt",destfile = "KIRC_survival.txt"
+)
+
+# Clinical Matrix
+download.file("https://tcga-xena-hub.s3.us-east-1.amazonaws.com/download/TCGA.KIRC.sampleMap%2FKIRC_clinicalMatrix", "KIRC_clinicalMatrix")
+```
+```{r}
+library(R.utils)
+
+# Only download & unpack if not yet present
+if (!file.exists("HiSeqV2")) {
+  download.file("https://tcga-xena-hub.s3.us-east-1.amazonaws.com/download/TCGA.KIRC.SampleMap%2FHiSeqV2.gz",
+                destfile = "HiSeqV2.gz", mode = "wb")
+  R.utils::gunzip("HiSeqV2.gz", remove = TRUE)
+}
+
+if (!file.exists("HumanMethylation450")) {
+  download.file("https://tcga-xena-hub.s3.us-east-1.amazonaws.com/download/TCGA.KIRC.SampleMap%2FHumanMethylation450.gz",
+                destfile = "HumanMethylation450.gz", mode = "wb")
+  R.utils::gunzip("HumanMethylation450.gz", remove = TRUE)
+}
+```
+
+
+Data loading and sample ID standardization
+```{r}
+# RNA-seq data
+rna.data <- read.table("HiSeqV2", sep="\t", header=TRUE, row.names=1)
+rna.data <- as.matrix(rna.data)
+colnames(rna.data) <- gsub("\\.", "-", colnames(rna.data))
+dim(rna.data)
+rna.data[1:3,1:3]
+
+# Survival data
+surv.data <- read.table("KIRC_survival.txt", sep="\t", header=TRUE, row.names=1)
+rownames(surv.data) <- gsub("\\.", "-", rownames(surv.data))
+surv.data[1:3,]
+
+# Clinical data
+clin.data <- read.table("KIRC_clinicalMatrix", sep="\t", header=TRUE, row.names=1)
+rownames(clin.data) <- gsub("\\.", "-", rownames(clin.data))
+clin.data[1:3,]
+
+# sample matching
+common.samples <- intersect(colnames(rna.data), rownames(surv.data))
+
+rna.data  <- rna.data[, common.samples]
+surv.data <- surv.data[common.samples, ]
+clin.data <- clin.data[common.samples, ]
+```
+
+
+Construction of survival analysis objects
+```{r}
+# Create survival object, look for associations with patient outcomes
+os.time <- surv.data[colnames(rna.data), "OS.time"]
+os.event <- as.numeric(surv.data[colnames(rna.data), "OS"])
+kirc.os <- Surv(os.time, os.event)
+
+# fit a single Cox Proportional Hazards regression model to look at survival in the cohort
+coxph(kirc.os ~rna.data[1,])
+```
+
+
+Batch univariate Cox regression (core screening step)
+```{r}
+# fit a univariate model for each genes's expression, and find those most significantly associated to patient outcome
+n <- nrow(rna.data)
+results.univariate <- data.frame(
+  HR   = rep(NA_real_, n),
+  LCI  = rep(NA_real_, n),
+  UCI  = rep(NA_real_, n),
+  PVAL = rep(NA_real_, n),
+  row.names = rownames(rna.data)
+)
+
+
+for(i in 1:nrow(rna.data)) {
+  coxphmodel <- coxph(kirc.os ~ as.numeric(rna.data[i,]))
+  s <- summary(coxphmodel)
+  results.univariate[i,] <- c(s$coef[1,2], s$conf.int[1,3:4], s$coef[1,5])
+}
+
+# Adjust p-values using FDR
+results.univariate$FDR <- p.adjust(results.univariate$PVAL, method="fdr")
+
+# Sort by significance
+results.univariate <- results.univariate[order(results.univariate$FDR),]
+head(results.univariate, 10)
+```
+
+
+Clinical covariate screening
+```{r}
+# First find out which clinical data are associated with survival
+clin.data<-clin.data[colnames(rna.data),]
+
+# Age
+sum(is.na(clin.data$age_at_initial_pathologic_diagnosis)) # 0
+age <- as.numeric(clin.data$age_at_initial_pathologic_diagnosis)
+
+# Gender
+sum(is.na(clin.data$gender)) # 0
+gender <- as.numeric(clin.data$gender == "MALE")
+
+# Grade
+# View the original distribution
+unique_grades <- unique(clin.data$neoplasm_histologic_grade)
+print(unique_grades) #"G2" "G4" "G3" "G1" "GX" ""  
+# Statistical problem data
+problem_grade_count <- sum(clin.data$neoplasm_histologic_grade %in% c("GX", ""), na.rm = TRUE)
+print(problem_grade_count) # 8
+# Create a valid data mask
+valid_grade_mask <- !clin.data$neoplasm_histologic_grade %in% c("GX", "")
+# Filter valid data
+valid_grade_data <- clin.data[valid_grade_mask, ]
+valid_os_grade <- kirc.os[valid_grade_mask]
+# Verify data alignment
+stopifnot(length(valid_os_grade) == nrow(valid_grade_data))
+# Grade grouping: G3 or G4 = high
+grade.high <- rep(0, nrow(valid_grade_data))
+grade.high[grep("G3|G4", valid_grade_data$neoplasm_histologic_grade)] <- 1
+
+summary(coxph(valid_os_grade ~ grade.high))$coef
+
+# Stage
+# View the original distribution
+unique_stage <- unique(clin.data$pathologic_stage)
+print(unique_stage) # "Stage I"       "Stage IV"      "Stage III"     "Stage II"      "[Discrepancy]"
+# Statistical problem data
+problem_stage_count <- sum(clin.data$pathologic_stage == "[Discrepancy]", na.rm = TRUE)
+print(problem_stage_count) # 2
+# Create a valid data mask
+valid_stage_mask <- !clin.data$pathologic_stage %in% "[Discrepancy]"
+# Filter valid data
+valid_stage_data <- clin.data[valid_stage_mask, ]
+valid_os_stage <- kirc.os[valid_stage_mask]
+# Verify data alignment
+stopifnot(length(valid_os_stage) == nrow(valid_stage_data))
+# Stage grouping: stage III or IV = high
+stage.high <- rep(0, nrow(valid_stage_data))
+stage.high[grep("Stage III|Stage IV", valid_stage_data$pathologic_stage)] <- 1
+
+summary(coxph(valid_os_stage ~ stage.high))$coef
+
+# stage T grouping: T3 or T3a or T3b or T3c or T4 = high
+unique_stage_T <- unique(clin.data$pathologic_T)
+print(unique_stage_T) #  "T1b" "T3a" "T1a" "T2"  "T3b" "T4"  "T1"  "T2a" "T3"  "T3c" "T2b"
+stage.T.high <- rep(0, nrow(clin.data))
+stage.T.high[grep("T3|T3a|T3b|T3c|T4", clin.data$pathologic_T)] <- 1
+
+# stage M
+# View the original distribution
+unique_stage_M <- unique(clin.data$pathologic_M)
+print(unique_stage_M) #  "M0" "M1" "MX" ""  
+# Statistical problem data
+problem_stage_M_count <- sum(clin.data$pathologic_M %in% c("MX", ""), na.rm = TRUE)
+print(problem_stage_M_count) # 33
+# Create a valid data mask
+valid_M_mask <- !clin.data$pathologic_M %in% c("MX", "")
+# Filter valid data
+valid_M_data <- clin.data[valid_M_mask, ]
+valid_os_M <- kirc.os[valid_M_mask]
+# Verify data alignment
+stopifnot(length(valid_os_M) == nrow(valid_M_data))
+# stage M: M1 = high
+stage.M.high <- rep(0, nrow(valid_M_data))
+stage.M.high[grep("M1", valid_M_data$pathologic_M)] <- 1
+
+summary(coxph(valid_os_M ~ stage.M.high))$coef
+
+# stage N: Due to 52% of the N staging data being missing, this variable was not included in the final model
+unique_stage_N <- unique(clin.data$pathologic_N)
+print(unique_stage_N) # "N0" "NX" "N1"
+problem_stage_N_count <- sum(clin.data$pathologic_N == "NX", na.rm = TRUE)
+print(problem_stage_N_count) # 310
+
+# Test associations
+summary(coxph(kirc.os ~ age))$coef 
+summary(coxph(kirc.os ~ gender))$coef
+summary(coxph(valid_os_grade ~ grade.high))$coef
+summary(coxph(valid_os_stage ~ stage.high))$coef
+summary(coxph(kirc.os ~ stage.T.high))$coef
+summary(coxph(valid_os_M ~ stage.M.high))$coef
+```
+Highly significant predictors (all p<0.001): Age (HR=1.03), Grade.high (HR=2.61), Stage.high (HR=3.78), Stage.T.high (HR=2.99), Stage.M.high (HR=4.50, strongest effect)
+Not associated: Gender (HR=0.94, p=0.65)
+
+
+Univariate Cox results for clinical variables(forest map)
+```{r}
+library(forestplot)
+
+# Fit a univariate Cox proportional hazards model to multiple clinical variables separately
+vars.df <- list(
+  age     = coxph(kirc.os ~ age),
+  gender  = coxph(kirc.os ~ gender),
+  grade   = coxph(valid_os_grade ~ grade.high),
+  stage   = coxph(valid_os_stage ~ stage.high),
+  Tstage  = coxph(kirc.os ~ stage.T.high),
+  Mstage  = coxph(valid_os_M ~ stage.M.high)
+)
+
+# Extract Cox model results
+res <- lapply(vars.df, function(fit) {
+  s  <- summary(fit)$coef[1, ]            
+  HR <- s["exp(coef)"]
+  se <- s["se(coef)"]
+  z  <- qnorm(0.975)                     
+  lower <- exp(log(HR) - z * se)
+  upper <- exp(log(HR) + z * se)
+  c(HR = HR, lower = lower, upper = upper, p = s["Pr(>|z|)"])
+})
+
+res <- as.data.frame(do.call(rbind, res))
+
+# Text table of forest map
+text_table <- cbind(c("Variable", rownames(res)),
+                    c("HR (95 %CI)", sprintf("%.2f (%.2f–%.2f)",
+                                             res$HR, res$lower, res$upper)),
+                    c("P value", ifelse(res$p<0.001, "<0.001",
+                                        sprintf("%.3f", res$p))))
+
+# Draw a forest map
+forestplot(text_table,
+           mean = c(NA, res$HR),
+           lower = c(NA, res$lower),
+           upper = c(NA, res$upper),
+           zero = 1,
+           boxsize = 0.2,
+           lineheight = unit(8, "mm"),
+           hrzl_lines = list("2" = gpar(lty = 2, col = "gray")),
+           col = fpColors(box = "royalblue", lines = "royalblue", zero = "gray"),
+           title = "Univariate Cox results for clinical variables",
+           xlab = "Hazard Ratio (95% CI)")
+```
+
+
+
+Multivariate Cox regression: fit a multivariate model using these covariates for each genes's expression, and find those most significantly associated to patient outcome
+```{r}
+# sample matching
+complete.samples <- intersect(
+  intersect(rownames(valid_grade_data), rownames(valid_stage_data)), 
+  rownames(valid_M_data)
+)
+
+complete.rna.data  <- rna.data[, complete.samples]
+complete.surv.data <- surv.data[complete.samples, ]
+complete.clin.data <- clin.data[complete.samples, ]
+
+# Create survival object
+complete.os.time <- surv.data[colnames(complete.rna.data), "OS.time"]
+complete.os.event <- as.numeric(surv.data[colnames(complete.rna.data), "OS"])
+complete.kirc.os <- Surv(complete.os.time, complete.os.event)
+
+# Align clinical and expression data
+complete.clin.data <- clin.data[colnames(complete.rna.data),]
+
+# Validate the concordance of column names in gene expression data with row names in survival and clinical data
+all(rownames(complete.clin.data) == rownames(complete.surv.data) & rownames(complete.clin.data) == colnames(complete.rna.data))
+# "Verify that the column names of the gene expression data are in the same order as the row names of the survival data and clinical data."
+
+# Clinical covariates
+complete.age <- as.numeric(complete.clin.data$age_at_initial_pathologic_diagnosis)
+complete.grade.high <- rep(0, nrow(complete.clin.data))
+complete.grade.high[grep("G3|G4", complete.clin.data$neoplasm_histologic_grade)] <- 1
+complete.stage.high <- rep(0, nrow(complete.clin.data))
+complete.stage.high[grep("Stage III|Stage IV", complete.clin.data$pathologic_stage)] <- 1
+complete.stage.T.high <- rep(0, nrow(complete.clin.data))
+complete.stage.T.high[grep("T3|T3a|T3b|T3c|T4", complete.clin.data$pathologic_T)] <- 1
+complete.stage.M.high <- rep(0, nrow(complete.clin.data))
+complete.stage.M.high[grep("M1", complete.clin.data$pathologic_M)] <- 1
+
+# multivariate Cox regression
+n <- nrow(complete.rna.data) 
+results.multivariate <- data.frame(
+  HR   = rep(NA_real_, n),
+  LCI  = rep(NA_real_, n),
+  UCI  = rep(NA_real_, n),
+  PVAL = rep(NA_real_, n),
+  row.names = rownames(complete.rna.data)
+)
+
+for(i in 1:nrow(complete.rna.data)) {
+  coxphmodel <- coxph(complete.kirc.os ~ complete.rna.data[i,] + complete.age + complete.grade.high + complete.stage.high + complete.stage.T.high + complete.stage.M.high)
+  s <- summary(coxphmodel)
+  results.multivariate[i,] <- c(s$coef[1,2], s$conf.int[1,3:4], s$coef[1,5])
+}
+
+results.multivariate$FDR <- p.adjust(results.multivariate$PVAL, method="fdr")
+results.multivariate <- results.multivariate[order(results.multivariate$FDR),]
+head(results.multivariate, 10)
+```
+
+
+Perform univariate Cox regression for each gene using the same cohort of multivariate models. 
+```{r}
+results.univariate <- data.frame(
+  HR   = rep(NA_real_, n),
+  LCI  = rep(NA_real_, n),
+  UCI  = rep(NA_real_, n),
+  PVAL = rep(NA_real_, n),
+  row.names = rownames(complete.rna.data)
+)
+
+for(i in 1:nrow(complete.rna.data)) {
+  coxphmodel <- coxph(complete.kirc.os ~ as.numeric(complete.rna.data[i,]))
+  s <- summary(coxphmodel)
+  results.univariate[i,] <- c(s$coef[1,2], s$conf.int[1,3:4], s$coef[1,5])
+}
+
+results.univariate$FDR <- p.adjust(results.univariate$PVAL, method="fdr")
+results.univariate <- results.univariate[order(results.univariate$FDR),]
+head(results.univariate, 10)
+```
+Multivariate analysis reveals protective effects (GBA3, SLC3A1, TMEM27) not apparent in univariate analysis
+Most univariate hits (e.g., ANAPC7 HR=6.46) drop out, indicating they are not independent predictors
+Only STX1A and MARS remain significant after multivariate adjustment, indicating robust independent prognostic value
+
+
+```{r}
+summary(rna.data["GBA3",])
+
+results.univariate["GBA3",]
+results.multivariate["GBA3",]
+```
+
+
+
+Kaplan–Meier and Multivariate Cox Analyses of GBA3 Expression and Survival
+```{r}
+# Create binary GBA3-high (1) vs GBA3-low (0) based on median expression
+GBA3.high <- as.numeric(complete.rna.data["GBA3",] > median(complete.rna.data["GBA3",]))
+table(GBA3.high)
+
+# Multivariate Cox model
+cox_model_GBA3.high <- coxph(complete.kirc.os ~ GBA3.high + complete.age + complete.grade.high + complete.stage.high + complete.stage.T.high + complete.stage.M.high)
+summary(cox_model_GBA3.high)
+
+# Visualize the Kaplan-Meier Plot for GBA3
+plot(
+  survfit(complete.kirc.os ~ GBA3.high),
+  col=c("black", "red"),
+  lwd=2,
+  xlab="OS time (days)", ylab="Proportion Surviving",
+  main="Survival analysis of GBA3 expression in KIRC",
+  xlim = c(0, 5000) 
+)
+legend("topright", legend=c("GBA3-high", "GBA3-low"), col=c("red", "black"), lwd=2)
+text(4000, 0.05, "HR=0.49 (95% CI 0.36-0.66)
+p=2.94e-06")
+```
+
+
+Let's explore GBA3 expression differences explained by methylation
+```{r}
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+# Install chip annotation package+minfi
+BiocManager::install(c("minfi", "IlluminaHumanMethylation450kanno.ilmn12.hg19"))
+
+# Download from minifi
+library(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+library(minfi)
+
+# Extract the annotation data frame
+meth.annot <- getAnnotation(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+head(meth.annot)
+```
+
+
+Load methylation matrix
+```{r}
+meth.data <- read.table("HumanMethylation450", sep = "\t", header = TRUE, row.names = 1)
+colnames(meth.data) <- gsub("\\.", "-", colnames(meth.data))
+
+# Align samples with RNA
+rna.data2  <- complete.rna.data[, colnames(complete.rna.data) %in% colnames(meth.data)]
+meth.data2 <- meth.data[, colnames(meth.data) %in% colnames(rna.data2)]
+surv.data2 <- complete.surv.data[colnames(rna.data2), ]
+
+# Order consistently
+rna.data2  <- rna.data2[,  order(colnames(rna.data2))]
+meth.data2 <- meth.data2[, order(colnames(meth.data2))]
+surv.data2 <- surv.data2[colnames(rna.data2), ]
+
+# Force methylation to numeric matrix
+meth.data2 <- as.matrix(meth.data2)
+storage.mode(meth.data2) <- "numeric"
+```
+
+
+```{r}
+rna.data2[1:3,1:4]
+meth.data2[1:3,1:4]
+```
+
+
+Get probes for GBA3 
+```{r}
+# Extract probes for GBA3 from methylation annotation file 'meth.annot'
+GBA3.probes  <- rownames(meth.annot)[grepl("\\bGBA3\\b",  meth.annot$UCSC_RefGene_Name)]
+
+# Subset methylation to those probes
+meth.data.GBA3 <- meth.data2[GBA3.probes, , drop = FALSE]
+```
+
+
+Filter probes with >50% missing values
+```{r}
+na.count <- apply(meth.data.GBA3, 1, function(x) sum(is.na(x))) # Calculate the number of missing values for each row
+meth.data.GBA3 <- meth.data.GBA3[na.count <= 0.5 * ncol(meth.data.GBA3), , drop = FALSE] # Filter out rows with missing values not exceeding half of the total number of columns(samples)
+
+nrow(meth.data.GBA3)
+```
+
+
+Correlation between GBA3 expression and DNA methylation
+```{r}
+# Prepare result container
+results <- matrix(NA_real_, nrow = nrow(meth.data.GBA3), ncol = 4)
+rownames(results) <- rownames(meth.data.GBA3)
+colnames(results) <- c("Cor.GBA3", "P.GBA3", # Correlation coefficient and p-value between methylation of the probe and GBA3 expression
+                       "MedianMeth.High", "MedianMeth.Low") # Median methylation level of GBA3 high/low expression group
+
+# GBA3 high/low groups based on RNA
+GBA3.expr <- as.numeric(rna.data2["GBA3", ])
+GBA3.high2 <- as.numeric(GBA3.expr > median(GBA3.expr, na.rm = TRUE)) # Divide the sample into two halves based on the median expression level of GBA3: Above median=1 (high group), below=0 (low group)
+
+# For each probe, calculate the Pearson correlation coefficient and significance p-value between its methylation value y and GBA3 expression
+# Loop safely using seq_len()
+for (i in seq_len(nrow(meth.data.GBA3))) {
+  y <- as.numeric(meth.data.GBA3[i, ])
+
+  # Use complete.obs to handle missingness
+  results[i, 1] <- cor.test(GBA3.expr,  y, use = "complete.obs")$estimate
+  results[i, 2] <- cor.test(GBA3.expr,  y, use = "complete.obs")$p.value
+}
+
+# Group-wise median methylation for GBA3-high vs GBA3-low expression group
+results[, 3] <- apply(meth.data.GBA3[, GBA3.high2 == 1, drop = FALSE],
+                      1, median, na.rm = TRUE)
+results[, 4] <- apply(meth.data.GBA3[, GBA3.high2 == 0, drop = FALSE],
+                      1, median, na.rm = TRUE)
+
+print(results)
+```
+
+
+Probe methylation by gene expression grouping for GBA3  (GBA3-high vs GBA3-low)
+```{r}
+# Wilcoxon rank-sum test:Determine whether there is a significant difference in the median methylation between the high and low expression groups
+# cg04847638
+wilcox.test(meth.data.GBA3["cg04847638", GBA3.high2 == 1],
+            meth.data.GBA3["cg04847638", GBA3.high2 == 0],
+            exact = FALSE)   
+
+# cg25080182
+wilcox.test(meth.data.GBA3["cg25080182", GBA3.high2 == 1],
+            meth.data.GBA3["cg25080182", GBA3.high2 == 0],
+            exact = FALSE)
+
+# cg25510164
+wilcox.test(meth.data.GBA3["cg25510164", GBA3.high2 == 1],
+            meth.data.GBA3["cg25510164", GBA3.high2 == 0],
+            exact = FALSE)
+
+# Annotation positioning
+anno.sub <- meth.annot[rownames(meth.data.GBA3),
+                      c("chr", "pos", "UCSC_RefGene_Name", "UCSC_RefGene_Group", "Relation_to_Island")]
+print(anno.sub)
+```
+cg25080182 emerges as the sole methylation mark that inversely and robustly tracks GBA3 expression in this cohort
+
+
+scatter plot
+```{r}
+# cg04847638
+plot(
+  meth.data2["cg04847638",],
+  rna.data2["GBA3",],
+  xlab="cg04847638 (methylation beta value)",
+  ylab="GBA3 RNAseq expression"
+)
+abline(lm(rna.data2["GBA3",] ~ meth.data2["cg04847638",]))
+
+png("KIRC_GBA3_ExpVsMeth2.png")
+plot(
+  meth.data2["cg04847638",],
+  rna.data2["GBA3",],
+  xlab="cg04847638 (methylation beta value)",
+  ylab="GBA3 RNAseq expression"
+)
+abline(lm(rna.data2["GBA3",] ~ meth.data2["cg04847638",]))
+dev.off()
+
+# cg25080182
+plot(
+  meth.data2["cg25080182",],
+  rna.data2["GBA3",],
+  xlab="cg25080182 (methylation beta value)",
+  ylab="GBA3 RNAseq expression"
+)
+abline(lm(rna.data2["GBA3",] ~ meth.data2["cg25080182",]))
+
+png("KIRC_GBA3_ExpVsMeth3.png")
+plot(
+  meth.data2["cg25080182",],
+  rna.data2["GBA3",],
+  xlab="cg25080182 (methylation beta value)",
+  ylab="GBA3 RNAseq expression"
+)
+abline(lm(rna.data2["GBA3",] ~ meth.data2["cg25080182",]))
+dev.off()
+
+# cg25510164
+plot(
+  meth.data2["cg25510164",],
+  rna.data2["GBA3",],
+  xlab="cg25510164 (methylation beta value)",
+  ylab="GBA3 RNAseq expression"
+)
+abline(lm(rna.data2["GBA3",] ~ meth.data2["cg25510164",]))
+
+png("KIRC_GBA3_ExpVsMeth4.png")
+plot(
+  meth.data2["cg25510164",],
+  rna.data2["GBA3",],
+  xlab="cg25510164 (methylation beta value)",
+  ylab="GBA3 RNAseq expression"
+)
+abline(lm(rna.data2["GBA3",] ~ meth.data2["cg25510164",]))
+dev.off()
+```
+
+
+boxplot
+```{r}
+library(ggplot2)
+
+# cg04847638
+beta  <- meth.data.GBA3["cg04847638", ]
+group <- factor(GBA3.high2, labels = c("Low", "High"))
+
+ggplot(data.frame(beta, group), aes(x = group, y = beta, fill = group)) +
+  geom_boxplot(outlier.shape = 1, outlier.size = 2, width = 0.4) +
+  labs(title = "cg04847638 Methylation by GBA3 Expression",
+       x = "GBA3 Expression Group",
+       y = "Methylation β-value") +
+  theme_minimal(base_size = 14)
+
+# cg25080182
+beta  <- meth.data.GBA3["cg25080182", ]
+group <- factor(GBA3.high2, labels = c("Low", "High"))
+
+ggplot(data.frame(beta, group), aes(x = group, y = beta, fill = group)) +
+  geom_boxplot(outlier.shape = 1, outlier.size = 2, width = 0.4) +
+  labs(title = "cg25080182 Methylation by GBA3 Expression",
+       x = "GBA3 Expression Group",
+       y = "Methylation β-value") +
+  theme_minimal(base_size = 14)
+
+# cg25510164
+beta  <- meth.data.GBA3["cg25510164", ]
+group <- factor(GBA3.high2, labels = c("Low", "High"))
+
+ggplot(data.frame(beta, group), aes(x = group, y = beta, fill = group)) +
+  geom_boxplot(outlier.shape = 1, outlier.size = 2, width = 0.4) +
+  labs(title = "cg25510164 Methylation by GBA3 Expression",
+       x = "GBA3 Expression Group",
+       y = "Methylation β-value") +
+  theme_minimal(base_size = 14)
+```
+
+
+Survival analysis by BGA3 methylation(cg25080182)
+```{r}
+# Create binary variable based on median methylation
+GBA3.high3 <- as.numeric(meth.data.GBA3["cg25080182",] > median(meth.data.GBA3["cg25080182",]))
+surv.data2$GBA3.high3 <- GBA3.high3
+
+# Univariate Cox: test if high methylation (GBA3 silencing) predicts worse OS
+cox_model_GBA3_meth <- coxph(Surv(OS.time, OS) ~ GBA3.high3, data = surv.data2)
+summary(cox_model_GBA3_meth)
+
+# KM plot: visualize survival difference between high- and low-methylation groups
+fit_meth <- survfit(Surv(OS.time, OS) ~ GBA3.high3, data = surv.data2)
+plot(fit_meth, 
+     col = c("black", "red"), 
+     lwd = 2,
+     xlab="OS time (days)", 
+     ylab="Proportion Surviving",
+     main = "Survival analysis of GBA3 methylation (cg25080182)",
+     xlim = c(0, 5000) 
+)
+legend("topright", c("GBA3-high", "GBA3-low"), col=c("red", "black"), lwd=2)
+text(4000, 0.05, "HR=2.51 (95% CI 1.69-3.72)
+p=4.76e-06")
+```
+
+
+Multivariate Cox model: tests whether GBA3-methylation status remains significant after adjusting for GBA3 expression and significant clinical covariates
+```{r}
+# Add 4 new binary variables (0/1 variables) to convert "textual clinical information" into dummy variables for "high-risk"
+library(dplyr)
+
+clin.data_01 <- clin.data %>%
+  mutate(
+    grade.high = ifelse(grepl("G3|G4", neoplasm_histologic_grade), 1, 0),
+    stage.high = ifelse(grepl("Stage III|Stage IV", pathologic_stage), 1, 0),
+    stage.T.high = ifelse(grepl("T3|T3a|T3b|T3c|T4", pathologic_T), 1, 0),
+    stage.M.high = ifelse(grepl("M1", pathologic_M), 1, 0)
+  )
+# Append continuous GBA3 expression and binary clinical covariates to survival set
+exp_meth <- as.numeric(rna.data["GBA3", rownames(surv.data2)])
+surv.data2$exp_meth <- exp_meth
+surv.data2$age <- as.numeric(clin.data[rownames(surv.data2), "age_at_initial_pathologic_diagnosis"])
+surv.data2$grade <- as.numeric(clin.data_01[rownames(surv.data2), "grade.high"])
+surv.data2$stage <- as.numeric(clin.data_01[rownames(surv.data2), "stage.high"])
+surv.data2$stage_T <- as.numeric(clin.data_01[rownames(surv.data2), "stage.T.high"])
+surv.data2$stage_M <- as.numeric(clin.data_01[rownames(surv.data2), "stage.M.high"])
+
+# Multivariate Cox
+cox_model_meth <- coxph(Surv(OS.time, OS) ~ GBA3.high3 + exp_meth + age + grade + stage + stage_T +stage_M,
+                   data = surv.data2)
+summary(cox_model_meth)
+```
+
+
+Cox regression mediation analysis
+```{r}
+library(mediation)
+library(mets)
+
+GBA3_meth <- as.numeric(meth.data.GBA3["cg25080182", rownames(surv.data2)])
+surv.data2$GBA3_meth <- GBA3_meth
+
+# mediator model
+med.fit  <- lm(exp_meth ~ GBA3_meth, data = surv.data2)
+
+# Survival Model
+out.fit <- survreg(Surv(OS.time, OS) ~ GBA3_meth + exp_meth, data = surv.data2)
+
+# mediation analysis
+med.out <- mediate(med.fit, out.fit,
+                   treat   = "GBA3_meth",
+                   mediator= "exp_meth",
+                   sims    = 500,
+                   boot    = TRUE,
+                   outcome = "OS.time")
+
+summary(med.out)
+
+```
+
+
+Let's explore GBA3 expression differences explained by CNV
+```{r}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+library(data.table)
+library(dplyr)
+library(ggplot2)
+library(pheatmap)
+library(survival)
+library(UCSCXenaTools)
+```
+
+
+Download KIRC Copy Number Matrix (GISTIC2 Discrete Values)
+```{r}
+cnv_dl <- downloadTCGA(
+  project   = "KIRC",
+  data_type = "Gene Level Copy Number",
+  file_type = "Gistic2 thresholded",
+  destdir   = "data",
+  force     = FALSE
+)
+
+cnv_file <- cnv_dl$destfiles[1]
+cnv_raw <- fread(cnv_file)
+genes <- cnv_raw[[1]]
+cnv <- cnv_raw[, -1]
+cnv <- as.data.frame(cnv)
+rownames(cnv) <- genes
+```
+
+
+Check the "missingness" per sample
+```{r}
+missing_per_sample <- colMeans(is.na(cnv))
+summary(missing_per_sample)
+```
+
+Distribution of genomic instability in KIRC
+```{r}
+# Define CNV burden as the number of genes in a sample with non-zero CNV value
+cnv_burden <- apply(cnv != 0, 2, sum) 
+df_burden <- data.frame(Sample = names(cnv_burden), CNV_burden = cnv_burden) 
+ggplot(df_burden, aes(x = CNV_burden)) +
+  geom_histogram(bins = 40) +
+  theme_bw() +
+  xlab("Number of genes with |CNV| > 0") + 
+  ggtitle("Distribution of CNV burden across TCGA samples")
+```
+
+
+High-frequency variant gene
+```{r}
+# For each gene, how many samples it is altered in (CNV is nonzero)
+recurrent_counts <- rowSums(cnv != 0)
+top_genes <- sort(recurrent_counts, decreasing = TRUE)[1:20] 
+
+# Barplot of top recurrent genes
+df_top <- data.frame(Gene = factor(names(top_genes), levels = names(top_genes)),
+                     N_samples = as.numeric(top_genes))
+
+ggplot(df_top, aes(x = Gene, y = N_samples)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  theme_bw() +
+  ggtitle("Top 20 recurrent CNV genes")
+```
+
+
+Check if GBA3 CNV data exist
+```{r}
+if ("GBA3" %in% rownames(cnv)) {
+  GBA3_vals <- as.numeric(cnv["GBA3", ])
+  table(GBA3_vals)                  
+} else {
+  stop("GBA3 is not in the CNV matrix, please check the gene name or probe annotation
+")
+}
+GBA3_cnv <- t(cnv["GBA3", ])
+head(GBA3_cnv)
+```
+
+
+```{r}
+cnv_samples <- colnames(cnv)
+cnv_samples <-gsub("\\.", "-", cnv_samples)
+rownames(complete.surv.data) <- gsub("_", ".", rownames(complete.surv.data))
+
+# Keep only samples present in both datasets, preserving identical order
+keep_rows <- rownames(complete.surv.data) %in% cnv_samples
+surv_sub <- complete.surv.data[keep_rows, , drop = FALSE]
+common_id <- intersect(cnv_samples, rownames(complete.surv.data))
+cnv_samples <- cnv_samples[cnv_samples %in% common_id]  
+surv_sub <- complete.surv.data[match(common_id, rownames(complete.surv.data)), , drop = FALSE]
+
+# Quick sanity check of matched IDs
+head(cbind(cnv = cnv_samples[1:10],
+           surv = rownames(surv_sub)[1:10]))
+```
+
+
+
+```{r}
+# Ensure GBA3 CNV data exist
+if (!"GBA3" %in% rownames(cnv)) stop("GBA3 not found in dataset")
+
+colnames(cnv) <- gsub("\\.", "-", colnames(cnv))
+GBA3_vals <- as.numeric(cnv["GBA3", rownames(surv_sub)])
+
+# Create binary CNV indicator: Deleted (≤ –1) vs. Notdeleted (0,1)
+GBA3_status <- ifelse(GBA3_vals <= -1, "Deleted", "Notdeleted") |>
+                factor(levels = c("Deleted", "Notdeleted"))
+
+# Append categorical and dummy variables to survival table
+surv_sub$GBA3_status <- GBA3_status 
+surv_sub$GBA3_CNV_deleted <- ifelse(GBA3_status == "Deleted", 1, 0)
+
+table(surv_sub$GBA3_status)
+```
+
+
+Gene expression by CNV grouping for GBA3
+```{r}
+# Extract GBA3 RNA-seq values (in the same order as surv-sub)
+exp_vals <- as.numeric(rna.data["GBA3", rownames(surv_sub)])
+exp_vals_data <- rna.data[, rownames(surv_sub)]
+
+
+head(cbind(exp = colnames(exp_vals_data)[1:10],
+           surv = rownames(surv_sub)[1:10])) 
+
+# Pearson correlation: continuous expression vs. binary CNV status
+cnv_binary <- surv_sub$GBA3_CNV_deleted 
+exp.CNV <- cor.test(exp_vals, cnv_binary, method = "pearson")
+exp.CNV
+```
+```{r}
+plot(jitter(cnv_binary, amount = 0.05), exp_vals,
+     xlab = "CNV status (0=Notdeleted, 1=Deleted)",
+     ylab = "GBA3 mRNA expression",
+     pch  = 16, col = "#00000040",
+     main = "GBA3 expression vs CNV deletion")
+abline(lm(exp_vals ~ cnv_binary), col = "firebrick", lwd = 2)
+legend("bottomright", bty = "n",
+       legend = c(
+         sprintf("rpb = %.3f",  exp.CNV$estimate),
+         sprintf("P = %.2g",    exp.CNV$p.value),
+         sprintf("95%% CI [%.3f, %.3f]", exp.CNV$conf.int[1], exp.CNV$conf.int[2])
+       ),
+       text.col = "black", cex = 0.9)
+```
+
+
+Boxplot & Wilcoxon test
+```{r}
+# Median difference in gene expression between the deleted and notdeleted groups
+med_exp_CNV <- tapply(exp_vals, GBA3_status, median, na.rm = TRUE)
+med_exp_CNV
+delta_exp_CNV <- med_exp_CNV["Deleted"] - med_exp_CNV["Notdeleted"]
+delta_exp_CNV
+
+# Basic box diagram
+boxplot(exp_vals ~ GBA3_status,
+        col    = c("tomato", "steelblue"),
+        ylab   = "GBA3 mRNA expression",
+        xlab   = "CNV group",
+        main   = "GBA3 CNV status vs mRNA expression in KIRC",
+        notch  = TRUE)                
+# Wilcoxon rank-sum test
+w <- wilcox.test(exp_vals ~ GBA3_status, exact = FALSE)
+legend("bottomleft", bty = "n",
+       legend = c(
+         paste("Wilcoxon p =", signif(w$p.value, 3)),
+         paste("delta median expression = ", signif(delta_exp_CNV))
+         ))
+
+png("GBA3_CNV_vs_Expr_base.png", width = 700, height = 500, res = 120)
+boxplot(exp_vals ~ GBA3_status,
+        col    = c("tomato", "steelblue"),
+        ylab   = "GBA3 mRNA expression",
+        xlab   = "CNV group",
+        main   = "GBA3 CNV status vs mRNA expression in KIRC",
+        notch  = TRUE)                
+# Wilcoxon rank-sum test
+w <- wilcox.test(exp_vals ~ GBA3_status, exact = FALSE)
+legend("bottomleft", bty = "n",
+       legend = c(
+         paste("Wilcoxon p =", signif(w$p.value, 3)),
+         paste("delta median expression = ", signif(delta_exp_CNV))
+         ))
+dev.off()
+```
+Boxplot & Wilcoxon test confirm CNV-deleted tumors have significantly lower GBA3 mRNA (Δmedian = ‑0.8, p < 0.001).
+
+
+Survival analysis by GBA3 CNV (Deleted vs Notdeleted)
+```{r}
+surv_sub$GBA3_status <- GBA3_status 
+
+# Univariate Cox: does GBA3 CNV deletion predict poorer OS?
+cox_model_GBA3_status <- coxph(Surv(OS.time, OS) ~ GBA3_CNV_deleted, data = surv_sub)
+summary(cox_model_GBA3_status)
+
+# KM curve comparing Deleted vs Not-deleted
+fit <- survfit(Surv(OS.time, OS) ~ GBA3_status, data = surv_sub)
+plot(fit, 
+     col = c("red", "black"), 
+     lwd = 2,
+     xlab="OS time (days)", 
+     ylab="Proportion Surviving",
+     main = "Survival analysis of GBA3 CNV deletion",
+     xlim = c(0, 5000) 
+)
+legend("topright", c("Deleted", "Notdeleted"), col=c("red", "black"), lwd=2)
+text(4000, 0.05, "HR=2.06 (95% CI 1.43-2.98)
+p=0.000102")
+```
+
+
+Multivariate Cox model: tests whether CNV deletion remains significant after adjusting for GBA3 expression and significant clinical covariates
+```{r}
+# Add 4 new binary variables (0/1 variables) to convert "textual clinical information" into dummy variables for "high-risk"
+library(dplyr)
+
+clin.data_01 <- clin.data %>%
+  mutate(
+    grade.high = ifelse(grepl("G3|G4", neoplasm_histologic_grade), 1, 0),
+    stage.high = ifelse(grepl("Stage III|Stage IV", pathologic_stage), 1, 0),
+    stage.T.high = ifelse(grepl("T3|T3a|T3b|T3c|T4", pathologic_T), 1, 0),
+    stage.M.high = ifelse(grepl("M1", pathologic_M), 1, 0)
+  )
+
+surv_sub$GBA3_CNV_deleted <- ifelse(GBA3_status == "Deleted", 1, 0)
+surv_sub$exp_vals <- exp_vals
+surv_sub$age <- as.numeric(clin.data[rownames(surv_sub), "age_at_initial_pathologic_diagnosis"])
+surv_sub$grade <- as.numeric(clin.data_01[rownames(surv_sub), "grade.high"])
+surv_sub$stage <- as.numeric(clin.data_01[rownames(surv_sub), "stage.high"])
+surv_sub$stage_T <- as.numeric(clin.data_01[rownames(surv_sub), "stage.T.high"])
+surv_sub$stage_M <- as.numeric(clin.data_01[rownames(surv_sub), "stage.M.high"])
+
+cox_model <- coxph(Surv(OS.time, OS) ~ GBA3_CNV_deleted + exp_vals + age + grade + stage + stage_T +stage_M,
+                   data = surv_sub)
+summary(cox_model)
+```
+
+
+Causal mediation analysis to quantify the effect of GBA3 deletion on survival via the pathway:
+GBA3 deletion → decreased GBA3 expression → adverse prognostic impact.
+```{r}
+# mediator model
+med.fit1 <- glm(exp_vals ~ GBA3_CNV_deleted, data = surv_sub)
+
+# Survival Model
+out.fit1 <- survreg(Surv(OS.time, OS) ~ GBA3_CNV_deleted + exp_vals, data = surv_sub)
+
+# mediation analysis
+med.out1 <- mediate(med.fit1, out.fit1,
+                   treat   = "GBA3_CNV_deleted",
+                   mediator= "exp_vals",
+                   sims    = 500,
+                   boot    = TRUE,
+                   outcome = "OS.time")
+
+summary(med.out1)
+```
